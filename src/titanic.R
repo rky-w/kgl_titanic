@@ -409,7 +409,7 @@ as.integer(as.character(predict(rf.mod, test.clean)))
 
 test.preds <- ifelse(apply(votes, 1, mean) > .5, 1, 0)
 
-test.output <- data.frame(test$PassengerId, Survived = test.preds)
+test.output <- data.frame(PassengerId = test$PassengerId, Survived = test.preds)
 
 table(test.preds, test$Sex)
 
