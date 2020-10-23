@@ -4,6 +4,12 @@ library(mice)
 library(fastDummies)
 library(car)
 library(factoextra)
+library(caret)
+library(naivebayes)
+library(kernlab)
+library(mboost)
+library(ranger)
+library(xgboost)
 
 set.seed(2210)
 
@@ -20,13 +26,13 @@ surv <- train[, 2]
 
 # Combine data for joint processing
 comb.pre <- cbind(rbind(train[,-2], test), set = c(rep('Train', nrow(train)), rep('Test', nrow(test)))) %>% 
-  mutate(Pclass = factor(Pclass, ordered = TRUE),
+  mutate(Pclass = Pclass,
          Sex = as.factor(Sex),
          Embarked = as.factor(Embarked),
          Fare = ifelse(Fare == 0, NA, Fare),
-         cabin.pfx = as.factor(str_extract(comb$Cabin, '^[A-z]+')),
-         ticket.pfx = str_extract(comb$Ticket, '^[A-z\\.]+')
-         )
+         cabin.pfx = as.factor(str_extract(Cabin, '^[A-z]+')),
+         ticket.pfx = str_extract(Ticket, '^[A-z\\.]+')
+  )
 
 # Replace less common ticket prefixes with 'Other'
 comb.pre$ticket.pfx[comb.pre$ticket.pfx %in% names(which(prop.table(sort(table(comb.pre$ticket.pfx))) < .015))] <- 'Other'
@@ -109,7 +115,7 @@ comb %>%
 comb %>% 
   ggplot(aes(Age, fill = set)) + 
   geom_density(alpha = .5)
-  
+
 # Normality?
 shapiro.test(comb$Age)
 
@@ -146,7 +152,7 @@ data.frame(family, set = comb$set) %>%
   mutate(pct = freq / sum(freq)) %>% 
   ggplot(aes(x=family, y=pct, fill = set)) +
   geom_col(position = "dodge")
-  
+
 
 # Parents / Children / Siblings / Spouses
 
@@ -218,21 +224,196 @@ prop.table(table(comb$set, comb$cabin.pfx), margin = 1)
 comb.clean <- comb %>% 
   mutate(
     Age.trans = age.trans,
-    SibSp.ord = factor(SibSp, ordered = TRUE),
-    Parch.ord = factor(Parch, ordered = TRUE),
-    Ticket.pfx = ticket.pfx,
     Fare.trans = fare.trans,
-    Cabin.pfx = cabin.pfx
+    Title = title, 
+    Family = family,
+    Cluster = addat$cluster
   ) %>% 
-  select(!c(Name, Ticket, Cabin, cabin.pfx, ticket.pfx)) %>% 
-  dummy_cols(remove_first_dummy = TRUE, select_columns = c("Pclass", "Sex", "Embarked", "Ticket.pfx", "Cabin.pfx"))
+  select(-c(PassengerId, Name, Ticket, Fare, Cabin, Age))
+
 
 # Split back into train and test
-train.clean <- comb.clean %>% filter(set == 'Train') %>% select(!set)
-test.clean  <- comb.clean %>% filter(set == 'Test') %>%  select(!set)
+train.clean <- comb.clean %>% filter(set == 'Train') %>% select(-set)
+test.clean  <- comb.clean %>% filter(set == 'Test') %>%  select(-set)
+
+
+## Modelling on train.clean ----
+
+# CV setup
+tr.ctrl <- trainControl(method = "repeatedcv", 
+                        number = 10, 
+                        repeats = 5,
+                        allowParallel = TRUE,
+                        search = "grid")
+
+
+# Naive Bayes ----
+nb.grid <-  expand.grid(laplace = 1,
+                        usekernel = c(TRUE, FALSE),
+                        adjust = 1)
+
+nb.mod <- train(as.factor(surv)~., 
+                data = cbind(surv, train.clean), 
+                trControl = tr.ctrl, 
+                method = "naive_bayes",
+                tuneGrid = nb.grid
+)
+
+summary(nb.mod)
+print(nb.mod)
+confusionMatrix(table(predict(nb.mod, train.clean), surv))
+
+
+# Logistic Regression ----
+
+lr.mod <- train(as.factor(surv)~.,
+                data = cbind(surv, train.clean),
+                trControl = tr.ctrl,
+                method = "glmStepAIC",
+                family = binomial(link = "logit")
+)
+
+
+summary(lr.mod)
+print(lr.mod)
+confusionMatrix(table(predict(lr.mod, train.clean), surv))
+
+
+# Boosted logistic regression ----
+
+lb.grid <-  expand.grid(mstop = 10^(1:3),
+                        prune = 'yes'
+)
+
+lb.mod <- train(as.factor(surv)~.,
+                data = cbind(surv, train.clean),
+                trControl = tr.ctrl,
+                method = "glmboost",
+                family = Binomial(link = "logit"),
+                tuneGrid = lb.grid
+)
+
+
+summary(lb.mod)
+print(lb.mod)
+ggplot(lb.mod)
+confusionMatrix(table(predict(lb.mod, train.clean), surv))
+
+
+## SVM ----
+
+sv.grid <-  expand.grid(C = c(0.01, 0.1, 0.5, 1)
+)
+
+sv.mod <- train(as.factor(surv)~.,
+                data = cbind(surv, train.clean),
+                trControl = tr.ctrl,
+                method = "svmLinear",
+                tuneGrid = sv.grid
+)
+
+
+summary(sv.mod)
+print(sv.mod)
+ggplot(sv.mod)
+confusionMatrix(table(predict(sv.mod, train.clean), surv))
+
+## SVM Poly ----
+
+sp.grid <-  expand.grid(C = c(0.0001, 0.001, 0.01),
+                        degree = c(2,3),
+                        scale = c(TRUE)
+)
+
+sp.mod <- train(as.factor(surv)~.,
+                data = cbind(surv, train.clean),
+                trControl = tr.ctrl,
+                method = "svmPoly",
+                tuneGrid = sp.grid
+)
+
+
+summary(sp.mod)
+print(sp.mod)
+ggplot(sp.mod)
+confusionMatrix(table(predict(sp.mod, train.clean), surv))
+
+
+# Random forest ----
+
+rf.grid <-  expand.grid(mtry = 2:ncol(train.clean), 
+                        splitrule = c("gini", "extratrees"), 
+                        min.node.size = c(1,3,5)
+)
+
+rf.mod <- train(as.factor(surv)~.,
+                data = cbind(surv, train.clean),
+                trControl = tr.ctrl,
+                method = "ranger",
+                tuneGrid = rf.grid
+)
+
+
+summary(rf.mod)
+print(rf.mod)
+ggplot(rf.mod)
+confusionMatrix(table(predict(rf.mod, train.clean), surv))
+
+
+# xgboost ----
+
+# xg.ctrl <- trainControl(method = "repeatedcv", 
+#                         number = 2, 
+#                         repeats = 1,
+#                         allowParallel = TRUE,
+#                         search = "random")
+# 
+# xg.grid <-  expand.grid(
+#   nrounds = 10^(1:3),
+#   max_depth = 10^(1:3),
+#   eta = c(0.2, 0.3, 0.5),
+#   gamma = c(0, 1),
+#   colsample_bytree = c(0.5, 1),
+#   min_child_weight = c(1, 3, 5),
+#   subsample = c(0.5, 1)
+# )
+# 
+# xg.mod <- train(as.factor(surv)~.,
+#                 data = cbind(surv, train.clean),
+#                 trControl = xg.ctrl,
+#                 method = "xgbTree",
+#                 tuneGrid = xg.grid,
+#                 tuneLength = 1
+# )
+# 
+# 
+# summary(xg.mod)
+# print(xg.mod)
+# ggplot(xg.mod)
+# confusionMatrix(table(predict(xg.mod, train.clean), surv))
 
 
 
+
+
+
+## Ensemble predictions ----
+
+votes <- data.frame(
+as.integer(as.character(predict(lr.mod, test.clean))),
+as.integer(as.character(predict(sv.mod, test.clean))),
+as.integer(as.character(predict(sp.mod, test.clean))),
+as.integer(as.character(predict(lb.mod, test.clean))),
+as.integer(as.character(predict(rf.mod, test.clean)))
+)
+
+test.preds <- ifelse(apply(votes, 1, mean) > .5, 1, 0)
+
+test.output <- data.frame(test$PassengerId, Survived = test.preds)
+
+table(test.preds, test$Sex)
+
+write.csv(test.output, "./data/output/titanic_submission.csv", row.names = FALSE)
 
 
 
